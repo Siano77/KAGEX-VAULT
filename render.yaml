@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: kagex-vault-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_PATH
+        value: /var/data/kagex_vault.sqlite3
+      - key: REFERRAL_POINTS
+        value: "4"
+      - key: LOG_LEVEL
+        value: INFO
+    disk:
+      name: kagex-vault-data
+      mountPath: /var/data
+      sizeGB: 1
