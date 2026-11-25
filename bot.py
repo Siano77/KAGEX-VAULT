@@ -67,6 +67,7 @@ VIEWS = {
     "start": ("Welcome to KAGEX VAULT. Earn points by inviting friends, then redeem them for tools and files.", "start"),
     "profile": ("👤 <b>Your profile</b>\n\nPoints: <b>{points}</b>\nSuccessful referrals: <b>{referrals}</b>", "profile"),
     "tools": ("🎁 <b>Vault</b>\nChoose a reward below to see its point cost.", "tools"),
+    "redeem": ("🎟 <b>Redeem a code</b>\n\nSend <code>/redeem YOUR_CODE</code> to claim points. Each code can be used once per account and may expire or reach its use limit.", "redeem"),
     "referrals": ("👥 <b>Referrals</b>\nInvite a new user with your personal link. You receive <b>{referral_points} points</b> after they start the bot and complete any required channel joins.\n\nYour link:\n<code>{link}</code>\n\nOnly a new Telegram account starting through your link is counted; self-referrals and repeat starts do not earn points.", "referrals"),
     "help": ("KAGEX VAULT help\n\nUse the buttons to check your profile, browse rewards, redeem a code, or get your referral link. To claim a reward, open Tools and select it.\n\nCommands: <code>/start</code>, <code>/profile</code>, <code>/tools</code>, <code>/referrals</code>, <code>/redeem CODE</code>, <code>/help</code>", "help"),
 }
@@ -304,7 +305,7 @@ def inline_menu(rows: list[list[InlineKeyboardButton]] | None = None) -> InlineK
 
 
 async def send_view(update: Update, context: ContextTypes.DEFAULT_TYPE, view: str, *, use_reply_menu: bool = False, check_access: bool = True) -> None:
-    if check_access and view in ("profile", "tools", "referrals") and not await require_join(update, context):
+    if check_access and view in ("profile", "tools", "referrals", "redeem") and not await require_join(update, context):
         return
     text, media_key = VIEWS.get(view, VIEWS["help"])
     user_id = update.effective_user.id
@@ -339,6 +340,53 @@ async def send_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_typ
               "document": context.bot.send_document, "video": context.bot.send_video,
               "audio": context.bot.send_audio}.get(media_type, context.bot.send_document)
     await method(chat_id=chat_id, **{media_type: file_id}, caption=caption[:1024], reply_markup=reply_markup, parse_mode="HTML")
+
+
+def format_redeem_result(code: str, success: bool, points: int | None, balance: int, reason: str = "") -> str:
+    safe_code = html.escape(code.strip().upper())
+    if success:
+        return (
+            "🎉 <b>REDEMPTION SUCCESSFUL</b>\n\n"
+            f"🎟 <b>Code:</b> <code>{safe_code}</code>\n"
+            f"➕ <b>Points added:</b> <b>{points} pts</b>\n"
+            f"💰 <b>New balance:</b> <b>{balance} pts</b>\n\n"
+            "The points were added to your existing balance. Enjoy your rewards!"
+        )
+    error_messages = {
+        "That code does not exist.": ("CODE NOT FOUND", "Check the code spelling and try again. If it still fails, contact the bot owner."),
+        "That code has expired.": ("CODE EXPIRED", "This code is no longer valid. Ask the bot owner for a current code."),
+        "That code has reached its redemption limit.": ("CODE FULLY REDEEMED", "This code has reached its user limit. Ask the bot owner for another code."),
+        "You have already redeemed that code.": ("CODE ALREADY USED", "Each account can redeem a code only once."),
+        "Please send /start first.": ("START REQUIRED", "Open the bot with /start, then try the code again."),
+    }
+    heading, explanation = error_messages.get(reason, ("CODE NOT REDEEMED", reason or "Please check the code and try again."))
+    return (
+        f"❌ <b>{heading}</b>\n\n"
+        f"🎟 <b>Code:</b> <code>{safe_code}</code>\n"
+        f"ℹ️ {html.escape(explanation)}\n\n"
+        f"💰 <b>Your balance:</b> <b>{balance} pts</b>"
+    )
+
+
+async def send_redeem_result(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, chat_id: int | None = None) -> None:
+    message = update.effective_message
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 ᴠɪᴇᴡ ᴘʀᴏꜰɪʟᴇ", callback_data="profile")],
+        [InlineKeyboardButton("🎁 ʙʀᴏᴡsᴇ ᴛᴏᴏʟs", callback_data="tools")],
+    ])
+    image = get_media("redeem")
+    formatted = styled_html(text)
+    destination = chat_id or message.chat_id
+    if image:
+        try:
+            await send_media(context, destination, image["media_type"], image["file_id"], formatted, markup)
+            return
+        except Exception as exc:
+            log.warning("Could not send custom redeem media; falling back to text: %s", exc)
+    if chat_id is not None:
+        await context.bot.send_message(chat_id=destination, text=formatted, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+    else:
+        await message.reply_text(formatted, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -382,18 +430,45 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) != 1:
+        await send_view(update, context, "redeem")
+        return
     if not await require_join(update, context):
         return
-    if len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /redeem CODE")
-        return
-    ok, reason, points = redeem_code(context.args[0], update.effective_user.id)
-    await update.effective_message.reply_text(small_caps(f"✅ Code accepted. {points} points added to your existing balance." if ok else reason))
+    code = context.args[0]
+    ok, reason, points = redeem_code(code, update.effective_user.id)
+    account = user_row(update.effective_user.id)
+    balance = account["points"] if account else 0
+    response = format_redeem_result(code, ok, points, balance, reason)
+    await send_redeem_result(update, context, response)
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     data = q.data or ""
+    if data.startswith("redeem_code:"):
+        code = data.split(":", 1)[1].strip().upper()
+        user_id = update.effective_user.id
+        if not re.fullmatch(r"[A-Z0-9_-]{3,40}", code):
+            await q.answer("Invalid redeem code button.", show_alert=True)
+            return
+        if not user_row(user_id):
+            await q.answer("Open the bot in a private chat and send /start first, then tap Redeem again.", show_alert=True)
+            return
+        if not await require_join(update, context):
+            return
+        ok, reason, points = redeem_code(code, user_id)
+        account = user_row(user_id)
+        balance = account["points"] if account else 0
+        response = format_redeem_result(code, ok, points, balance, reason)
+        try:
+            await send_redeem_result(update, context, response, chat_id=user_id)
+        except Exception as exc:
+            log.warning("Could not send private redeem receipt to user %s: %s", user_id, exc)
+            await q.answer("Open the bot and send /start (or unblock it), then tap Redeem again.", show_alert=True)
+            return
+        await q.answer("Redeemed! Check your private chat for the receipt." if ok else "Check your private chat for the redemption details.")
+        return
     if data == "joincheck":
         joined, missing = await membership_status(update, context)
         if missing:
@@ -446,7 +521,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_view(update, context, "start")
         return
     if data in VIEWS:
-        if data in ("profile", "tools", "referrals") and not await require_join(update, context):
+        if data in ("profile", "tools", "referrals", "redeem") and not await require_join(update, context):
             return
         await q.answer()
         await send_view(update, context, data, check_access=False)
@@ -510,7 +585,20 @@ async def createcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         await update.effective_message.reply_text("Use a 3–40 character code (letters, numbers, _ or -), positive points, and non-negative expiry/limit values.")
         return
-    await update.effective_message.reply_text(f"Code {code} created: +{points} points; expires {expires or 'never'}; uses {max_uses or 'unlimited'}.")
+    expiry_label = f"{hours} hour(s) from creation" if hours else "Never"
+    uses_label = str(max_uses) if max_uses else "Unlimited"
+    confirmation = (
+        "🎟 <b>REDEEM CODE READY</b>\n\n"
+        f"🔐 <b>Code:</b> <code>{html.escape(code)}</code>\n"
+        f"💰 <b>Reward:</b> <b>{points} points</b>\n"
+        f"⏳ <b>Expires:</b> {expiry_label}\n"
+        f"👥 <b>Available redemptions:</b> {uses_label}\n\n"
+        "Tap the button below to redeem this code."
+    )
+    button = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎟 ʀᴇᴅᴇᴇᴍ ɴᴏᴡ", callback_data=f"redeem_code:{code}")
+    ]])
+    await update.effective_message.reply_text(styled_html(confirmation), parse_mode="HTML", reply_markup=button)
 
 
 def extract_media(message: Any) -> tuple[str, str | None]:
@@ -605,7 +693,7 @@ async def setimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_admin(update.effective_user.id):
         return
     if len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /setimage <start|profile|tools|referrals|help> then send the image or animation.")
+        await update.effective_message.reply_text("Usage: /setimage <start|profile|tools|redeem|referrals|help> then send the image or animation.")
         return
     key = context.args[0].lower().lstrip("/")
     if key not in VIEWS:
@@ -651,7 +739,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/addchannel CHAT JOIN_URL, /removechannel CHAT, /channels\n"
         "/chatid — show the numeric ID of this chat for private-group setup\n"
         "/setpoints USER_ID SIGNED_DELTA\n"
-        "/setimage start|profile|tools|referrals|help then send a photo/GIF\n",
+        "/setimage start|profile|tools|redeem|referrals|help then send a photo/GIF\n",
         parse_mode="HTML")
 
 
@@ -671,13 +759,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "🏠 ʜᴏᴍᴇ": "start", "home": "start", "↩️ ʀᴇᴛᴜʀɴ": "start", "return": "start",
         "👤 ᴘʀᴏꜰɪʟᴇ": "profile", "profile": "profile", "🎁 ᴛᴏᴏʟs": "tools", "tools": "tools",
         "👥 ʀᴇꜰᴇʀʀᴀʟs": "referrals", "referrals": "referrals", "📣 sᴜᴘᴘᴏʀᴛ": "support", "support": "support",
-        "🎟 ʀᴇᴅᴇᴇᴍ": "redeem_help", "redeem": "redeem_help",
+        "🎟 ʀᴇᴅᴇᴇᴍ": "redeem", "redeem": "redeem",
     }
     view = mapping.get(text)
     if view == "support":
         await update.effective_message.reply_text(f"sᴜᴘᴘᴏʀᴛ: {SUPPORT_URL}" if SUPPORT_URL else "ᴄᴏɴᴛᴀᴄᴛ ᴛʜᴇ ʙᴏᴛ ᴏᴡɴᴇʀ ғᴏʀ sᴜᴘᴘᴏʀᴛ.")
-    elif view == "redeem_help":
-        await update.effective_message.reply_text("ʀᴇᴅᴇᴇᴍ ᴀ ᴄᴏᴅᴇ ᴡɪᴛʜ /redeem CODE")
     elif view:
         await send_view(update, context, view)
 
