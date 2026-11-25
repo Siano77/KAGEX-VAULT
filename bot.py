@@ -303,8 +303,8 @@ def inline_menu(rows: list[list[InlineKeyboardButton]] | None = None) -> InlineK
     return InlineKeyboardMarkup(buttons)
 
 
-async def send_view(update: Update, context: ContextTypes.DEFAULT_TYPE, view: str, *, use_reply_menu: bool = False) -> None:
-    if view in ("profile", "tools", "referrals") and not await require_join(update, context):
+async def send_view(update: Update, context: ContextTypes.DEFAULT_TYPE, view: str, *, use_reply_menu: bool = False, check_access: bool = True) -> None:
+    if check_access and view in ("profile", "tools", "referrals") and not await require_join(update, context):
         return
     text, media_key = VIEWS.get(view, VIEWS["help"])
     user_id = update.effective_user.id
@@ -406,7 +406,6 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data.startswith("item:"):
         if not await require_join(update, context):
-            await q.answer()
             return
         try:
             item = get_item(int(data.split(":", 1)[1]))
@@ -423,7 +422,6 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data.startswith("claim:"):
         if not await require_join(update, context):
-            await q.answer()
             return
         try:
             item_id = int(data.split(":", 1)[1])
@@ -448,8 +446,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_view(update, context, "start")
         return
     if data in VIEWS:
+        if data in ("profile", "tools", "referrals") and not await require_join(update, context):
+            return
         await q.answer()
-        await send_view(update, context, data)
+        await send_view(update, context, data, check_access=False)
         return
     await q.answer()
 
@@ -482,6 +482,13 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     rows = channel_rows()
     await update.effective_message.reply_text("Force-join targets:\n" + ("\n".join(f"• {r['chat_ref']} → {r['join_url']}" for r in rows) or "(none)"))
+
+
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    chat = update.effective_chat
+    await update.effective_message.reply_text(f"Chat ID: <code>{chat.id}</code>", parse_mode="HTML")
 
 
 async def createcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -642,6 +649,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/items, /delitem ID\n"
         "/createcode CODE POINTS EXPIRY_HOURS MAX_USES (0 = unlimited)\n"
         "/addchannel CHAT JOIN_URL, /removechannel CHAT, /channels\n"
+        "/chatid — show the numeric ID of this chat for private-group setup\n"
         "/setpoints USER_ID SIGNED_DELTA\n"
         "/setimage start|profile|tools|referrals|help then send a photo/GIF\n",
         parse_mode="HTML")
@@ -680,7 +688,8 @@ async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([
             ("start", "Open the vault"), ("profile", "View points and referrals"),
             ("tools", "Browse rewards"), ("referrals", "Get your invite link"),
-            ("redeem", "Redeem a points code"), ("help", "How to use the bot"), ("admin", "Admin controls")])
+            ("redeem", "Redeem a points code"), ("help", "How to use the bot"),
+            ("admin", "Admin controls"), ("chatid", "Show this chat's ID (admins)")])
     except Exception as exc:
         log.warning("Could not set bot commands: %s", exc)
 
@@ -699,6 +708,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addchannel", add_channel_command))
     app.add_handler(CommandHandler("removechannel", remove_channel_command))
     app.add_handler(CommandHandler("channels", channels_command))
+    app.add_handler(CommandHandler("chatid", chatid_command))
     app.add_handler(CommandHandler("createcode", createcode_command))
     app.add_handler(CommandHandler("additem", additem_command))
     app.add_handler(CommandHandler("addtext", addtext_command))
