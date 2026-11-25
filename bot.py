@@ -111,6 +111,9 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_items_active ON items(active);
         """)
+        item_columns = {row["name"] for row in c.execute("PRAGMA table_info(items)").fetchall()}
+        if "reward_text" not in item_columns:
+            c.execute("ALTER TABLE items ADD COLUMN reward_text TEXT NOT NULL DEFAULT ''")
 
 
 def is_admin(user_id: int) -> bool:
@@ -166,6 +169,15 @@ def delete_channel(chat_ref: str) -> bool:
 def add_item(title: str, points: int, media_type: str, file_id: str) -> int:
     with db() as c:
         cur = c.execute("INSERT INTO items(title,points,media_type,file_id,created_at) VALUES(?,?,?,?,?)", (title, points, media_type, file_id, datetime.now(timezone.utc).isoformat()))
+        return int(cur.lastrowid)
+
+
+def add_bundle_item(title: str, points: int, media_type: str, file_id: str, reward_text: str) -> int:
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO items(title,points,media_type,file_id,reward_text,created_at) VALUES(?,?,?,?,?,?)",
+            (title, points, media_type, file_id, reward_text, datetime.now(timezone.utc).isoformat()),
+        )
         return int(cur.lastrowid)
 
 
@@ -490,7 +502,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer("ʀᴇᴡᴀʀᴅ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ", show_alert=True)
             return
         await q.answer()
-        text = f"<b>{html.escape(item['title'])}</b>\nCost: <b>{item['points']} points</b>\n\nRedeem this reward?"
+        bundle_note = "\n\nIncludes one file plus a separate text message." if item["reward_text"] else ""
+        text = f"<b>{html.escape(item['title'])}</b>\nCost: <b>{item['points']} points</b>{bundle_note}\n\nRedeem this reward?"
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ ʀᴇᴅᴇᴇᴍ", callback_data=f"claim:{item['item_id']}")],
                                        [InlineKeyboardButton("← ʙᴀᴄᴋ ᴛᴏ ᴛᴏᴏʟs", callback_data="tools")]])
         await q.message.reply_text(styled_html(text), parse_mode="HTML", reply_markup=markup)
@@ -515,6 +528,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             caption = styled_html(f"✅ Redeemed: <b>{html.escape(item['title'])}</b>")
             await send_media(context, q.message.chat_id, item["media_type"], item["file_id"], caption)
+            if item["reward_text"]:
+                await context.bot.send_message(chat_id=q.message.chat_id, text=item["reward_text"], parse_mode=None)
         return
     if data == "home":
         await q.answer()
@@ -648,6 +663,8 @@ async def addtext_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except ValueError:
         await update.effective_message.reply_text("Points must be a positive whole number, followed by a title.")
         return
+    context.application.bot_data.setdefault("pending_bundle", {}).pop(update.effective_user.id, None)
+    context.application.bot_data.setdefault("pending_media", {}).pop(update.effective_user.id, None)
     context.application.bot_data.setdefault("pending_text", {})[update.effective_user.id] = {
         "points": points, "title": title[:120],
     }
@@ -655,11 +672,43 @@ async def addtext_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.effective_message.reply_text(prompt + "\nUse /cancel to stop.")
 
 
+async def addbundle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "Usage: /addbundle <POINTS> <title>. Then send the file, followed by its text message."
+        )
+        return
+    try:
+        points = int(context.args[0])
+        title = " ".join(context.args[1:]).strip()
+        if points <= 0 or not title:
+            raise ValueError
+    except ValueError:
+        await update.effective_message.reply_text("Points must be a positive whole number, followed by a title.")
+        return
+    uid = update.effective_user.id
+    context.application.bot_data.setdefault("pending_text", {}).pop(uid, None)
+    context.application.bot_data.setdefault("pending_media", {}).pop(uid, None)
+    context.application.bot_data.setdefault("pending_bundle", {})[uid] = {
+        "points": points, "title": title[:120],
+    }
+    await update.effective_message.reply_text(
+        f"Now send the main reward file for '{title[:120]}' (ZIP or another supported file). "
+        "After the file is received, send the accompanying plain text. Use /cancel to stop."
+    )
+
+
 async def items_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
     rows = list_items(active_only=False)
-    text = "Rewards:\n" + ("\n".join(f"#{r['item_id']} — {r['title']} ({r['points']} pts) {'ACTIVE' if r['active'] else 'DISABLED'}" for r in rows) or "(none)")
+    text = "Rewards:\n" + ("\n".join(
+        f"#{r['item_id']} — {r['title']} ({r['points']} pts)"
+        f"{' [FILE + TEXT]' if r['reward_text'] else ''} {'ACTIVE' if r['active'] else 'DISABLED'}"
+        for r in rows
+    ) or "(none)")
     await update.effective_message.reply_text(text)
 
 
@@ -699,6 +748,8 @@ async def setimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if key not in VIEWS:
         await update.effective_message.reply_text("Supported views: " + ", ".join(VIEWS))
         return
+    context.application.bot_data.setdefault("pending_bundle", {}).pop(update.effective_user.id, None)
+    context.application.bot_data.setdefault("pending_text", {}).pop(update.effective_user.id, None)
     context.application.bot_data.setdefault("pending_media", {})[update.effective_user.id] = key
     await update.effective_message.reply_text(f"Now send the photo or animation for /{key}. Send /cancel to cancel.")
 
@@ -706,12 +757,26 @@ async def setimage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.application.bot_data.setdefault("pending_media", {}).pop(update.effective_user.id, None)
     context.application.bot_data.setdefault("pending_text", {}).pop(update.effective_user.id, None)
+    context.application.bot_data.setdefault("pending_bundle", {}).pop(update.effective_user.id, None)
     await update.effective_message.reply_text("ᴄᴀɴᴄᴇʟʟᴇᴅ.")
 
 
 async def media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     uid = update.effective_user.id
+    bundle = context.application.bot_data.setdefault("pending_bundle", {}).get(uid)
+    if bundle and is_admin(uid):
+        if bundle.get("file_id"):
+            await msg.reply_text("The bundle file is already saved. Send the accompanying text now, or /cancel to restart.")
+            return
+        media_type, file_id = extract_media(msg)
+        if not file_id:
+            await msg.reply_text("I couldn't read that file. Send a document/photo/video/animation/audio, or /cancel.")
+            return
+        bundle["media_type"] = media_type
+        bundle["file_id"] = file_id
+        await msg.reply_text("✅ File received. Now send the accompanying plain-text message (up to 4096 characters).")
+        return
     pending = context.application.bot_data.setdefault("pending_media", {}).get(uid)
     if pending and is_admin(uid):
         media_type, file_id = extract_media(msg)
@@ -734,6 +799,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "<b>KAGEX VAULT admin commands</b>\n"
         "/additem — attach a file and caption it: <code>/additem POINTS Title</code>\n"
         "/addtext — create a text reward: <code>/addtext POINTS Title</code>, then send the text\n"
+        "/addbundle — create one reward with a file and text: <code>/addbundle POINTS Title</code>, then send the file and text\n"
         "/items, /delitem ID\n"
         "/createcode CODE POINTS EXPIRY_HOURS MAX_USES (0 = unlimited)\n"
         "/addchannel CHAT JOIN_URL, /removechannel CHAT, /channels\n"
@@ -745,6 +811,21 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     raw_text = update.effective_message.text or ""
+    bundle = context.application.bot_data.setdefault("pending_bundle", {}).get(update.effective_user.id)
+    if bundle and is_admin(update.effective_user.id):
+        if not bundle.get("file_id"):
+            await update.effective_message.reply_text("Please send the reward file first, then send its accompanying text.")
+            return
+        if len(raw_text) > 4096:
+            await update.effective_message.reply_text("That text is too long for one Telegram message. Send up to 4096 characters, or /cancel.")
+            return
+        item_id = add_bundle_item(bundle["title"], bundle["points"], bundle["media_type"], bundle["file_id"], raw_text)
+        context.application.bot_data["pending_bundle"].pop(update.effective_user.id, None)
+        await update.effective_message.reply_text(
+            f"✅ Added bundle reward #{item_id}: {bundle['title']} ({bundle['points']} points). "
+            "Users will receive the file and text after one claim."
+        )
+        return
     pending = context.application.bot_data.setdefault("pending_text", {}).get(update.effective_user.id)
     if pending and is_admin(update.effective_user.id):
         if len(raw_text) + len(pending["title"]) + 2 > 4096:
@@ -798,6 +879,7 @@ def main() -> None:
     app.add_handler(CommandHandler("createcode", createcode_command))
     app.add_handler(CommandHandler("additem", additem_command))
     app.add_handler(CommandHandler("addtext", addtext_command))
+    app.add_handler(CommandHandler("addbundle", addbundle_command))
     app.add_handler(CommandHandler("items", items_command))
     app.add_handler(CommandHandler("delitem", delitem_command))
     app.add_handler(CommandHandler("setpoints", setpoints_command))
